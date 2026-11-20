@@ -1,0 +1,36 @@
+# Environments
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+
+# Heavy Datasets & Archives
+data/
+dataset/
+dataset2/
+*.zip
+*.tar
+*.gz
+
+# Heavy Models (Large weights: GitHub limit is 100MB)
+all_model/
+ov_model/
+*.pth
+*.pt
+*.onnx
+*.onnx.data
+*.bin
+
+# Videos
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# OS / Editor files
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
