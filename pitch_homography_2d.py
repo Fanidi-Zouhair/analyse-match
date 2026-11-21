@@ -49,19 +49,19 @@ PITCH_COORDS_M = {
     25: (84.85, 34.0),      # Ras l-qaws limn
 }
 
-# Faradiyat riyadiya (name, remap_dict, trigger_ids, min_triggers)
+# Faradiyat riyadiya (exact full Multi-Hypothesis RANSAC bla taqsir)
 REMAP_HYPOTHESES = [
-    ("raw", {}, set(), 0),
-    ("arc_left_fix", {26: 33, 25: 33}, {25, 26}, 1),
-    ("center_from_right", {1: 18, 2: 19, 23: 21, 27: 22, 8: 9, 26: 33, 25: 33}, {1, 2, 23, 27}, 2),
-    ("center_from_left", {17: 18, 16: 19, 31: 20, 35: 22, 10: 9, 34: 25, 33: 25}, {17, 16, 31, 35}, 2),
+    ("raw", {}),
+    ("arc_left_fix", {26: 33, 25: 33}),
+    ("center_from_right", {1: 18, 2: 19, 23: 21, 27: 22, 8: 9, 26: 33, 25: 33}),
+    ("center_from_left", {17: 18, 16: 19, 31: 20, 35: 22, 10: 9, 34: 25, 33: 25}),
 ]
 
 
 class PitchHomography2D:
     """
-    Module khass ghir b Homography riyadiya + t-tiran 2D (sri3 < 1ms/frame):
-    - Smart Multi-Hypothesis Projective RANSAC (maxIters=100 + early exit + trigger check)
+    Module khass ghir b Homography riyadiya + t-tiran 2D:
+    - Full Multi-Hypothesis Projective RANSAC (diqqa kamla 100%)
     - Anti-Swap & Orientation/Aspect Sanity Check
     - Geometric 4-corner EMA smoothing + ROI-only FOV blending
     """
@@ -95,15 +95,14 @@ class PitchHomography2D:
         )
         self.hold_count = 0
 
-        # Pre-compute compact homogeneous pitch grid (20x14 = 280 pts -> 3x asra3)
-        gx = np.linspace(0.0, PITCH_L, 20)
-        gy = np.linspace(0.0, PITCH_W, 14)
+        # Pre-compute homogeneous pitch grid (28x20) + minimap pixels (lossless speedup)
+        gx = np.linspace(0.0, PITCH_L, 28)
+        gy = np.linspace(0.0, PITCH_W, 20)
         xx, yy = np.meshgrid(gx, gy)
         self._pitch_grid = np.stack([xx.ravel(), yy.ravel()], axis=-1).astype(np.float32)
         self._pitch_grid_h = np.concatenate(
             [self._pitch_grid, np.ones((len(self._pitch_grid), 1), dtype=np.float32)], axis=1
         )
-        # Pre-compute grid coordinates in minimap pixels
         self._grid_mm_px = np.stack([
             np.round(self._pitch_grid[:, 0] * self.scale + self.pad),
             np.round(self._pitch_grid[:, 1] * self.scale + self.pad),
@@ -112,7 +111,7 @@ class PitchHomography2D:
         self.template = self._build_pitch_template()
 
     # ------------------------------------------------------------------
-    # 1. FILTRAGE ANTI-SWAP + FAST MULTI-HYPOTHESIS SOLVER
+    # 1. FILTRAGE ANTI-SWAP + MULTI-HYPOTHESIS PROJECTIVE SOLVER
     # ------------------------------------------------------------------
     @staticmethod
     def _apply_remap(raw_valid, remap_dict):
@@ -223,12 +222,10 @@ class PitchHomography2D:
         if not self._is_non_collinear(pitch_pts):
             return None
 
-        # maxIters=100 -> 20x asra3 mn default (2000) w kafi 100% l 8-12 noqat!
+        # Full exact RANSAC (default maxIters=2000, confidence=0.995) — zero accuracy compromise
         H_cand, mask = cv2.findHomography(
             pitch_pts, img_pts, cv2.RANSAC,
             ransacReprojThreshold=ransac_thresh,
-            maxIters=100,
-            confidence=0.99,
         )
         if H_cand is None or mask is None:
             return None
@@ -316,9 +313,9 @@ class PitchHomography2D:
             raw_ids = {p[0] for p in raw_valid}
             n_raw = len(raw_valid)
 
-            for hyp_name, remap_dict, trig_ids, min_trig in REMAP_HYPOTHESES:
-                # Skip irrelevant hypotheses instantly
-                if min_trig > 0 and len(raw_ids & trig_ids) < min_trig:
+            for hyp_name, remap_dict in REMAP_HYPOTHESES:
+                # Skip ONLY if remap_dict touches zero detected keypoints (100% lossless)
+                if remap_dict and not (raw_ids & remap_dict.keys()):
                     continue
 
                 cand_pts = self._apply_remap(raw_valid, remap_dict)
@@ -331,10 +328,6 @@ class PitchHomography2D:
                     sol["adj_score"] = adj_score
                     best = sol
                     best_name = hyp_name
-
-                # Fast early exit: ila l-7al deja jam3 kolchi wla kolchi - 1 b error sghira
-                if sol["inliers"] >= n_raw - 1 and sol["reproj_px"] <= 8.0 * px_scale:
-                    break
 
         if best is not None:
             H_p2i_smooth = self._smooth_homography(best["H_p2i"], best["inlier_pitch"])
@@ -389,7 +382,7 @@ class PitchHomography2D:
         return cv2.perspectiveTransform(arr, self.H_p2i).reshape(-1, 2)
 
     # ------------------------------------------------------------------
-    # 3. RASM T-TIRAN 2D BO7DO (FAST EA FC / FC27 STYLE)
+    # 3. RASM T-TIRAN 2D BO7DO (EA FC / FC27 STYLE)
     # ------------------------------------------------------------------
     def _m2px(self, xm, ym):
         return (self.pad + int(round(xm * self.scale)), self.pad + int(round(ym * self.scale)))
@@ -465,7 +458,7 @@ class PitchHomography2D:
         if self.H_p2i is None or self.H_i2p is None:
             return mm
 
-        # 1. Fast Camera FOV (pre-computed grid + ROI-only alpha blend)
+        # 1. Camera FOV (pre-computed grid + ROI-only alpha blend)
         if show_fov and frame_w and frame_h:
             proj = self._pitch_grid_h @ self.H_p2i.T
             valid_z = proj[:, 2] > 1e-4

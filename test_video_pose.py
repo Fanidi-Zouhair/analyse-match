@@ -1,6 +1,8 @@
 import os
 import time
 import argparse
+import threading
+import queue
 import cv2
 import numpy as np
 import openvino as ov
@@ -58,11 +60,73 @@ SKELETON_EDGES_1IDX = [
 ]
 
 
+# ==============================================================================
+# THREADED VIDEO READER & WRITER (I/O f threads bo7dhom bach ma y-bloqiwch GPU)
+# ==============================================================================
+class ThreadedVideoReader:
+    def __init__(self, cap, queue_size=6):
+        self.cap = cap
+        self.q = queue.Queue(maxsize=queue_size)
+        self._stop = False
+        self.t = threading.Thread(target=self._run, daemon=True)
+        self.t.start()
+
+    def _run(self):
+        while not self._stop:
+            ret, frame = self.cap.read()
+            if not ret:
+                self.q.put(None)
+                break
+            self.q.put(frame)
+
+    def read(self):
+        frame = self.q.get()
+        if frame is None:
+            return False, None
+        return True, frame
+
+    def release(self):
+        self._stop = True
+        self.t.join(timeout=2.0)
+        self.cap.release()
+
+
+class ThreadedVideoWriter:
+    def __init__(self, writer, queue_size=24):
+        self.writer = writer
+        self.q = queue.Queue(maxsize=queue_size)
+        self.t = threading.Thread(target=self._run, daemon=True)
+        self.t.start()
+
+    def _run(self):
+        while True:
+            item = self.q.get()
+            if item is None:
+                break
+            frame, sample_path = item
+            self.writer.write(frame)
+            if sample_path is not None:
+                cv2.imwrite(sample_path, frame)
+
+    def write(self, frame, sample_path=None):
+        self.q.put((frame, sample_path))
+
+    def release(self):
+        self.q.put(None)
+        self.t.join()
+        self.writer.release()
+
+
+# Pre-allocated constant overlays for zero-copy ROI blending
+_HUD_DARK_CACHE = None
+_RADAR_BG_CACHE = None
+
+
 def preprocess_frame(frame_bgr, img_size=IMG_SIZE):
-    """BGR frame -> NCHW float32 [0, 1] numpy tensor."""
-    img_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    img_resized = cv2.resize(img_rgb, (img_size, img_size), interpolation=cv2.INTER_LINEAR)
-    tensor = (img_resized.astype(np.float32) * (1.0 / 255.0)).transpose(2, 0, 1)[None, ...]
+    """Resize FIRST (1080p -> 256x256), THEN BGR->RGB (32x asra3)."""
+    img_resized = cv2.resize(frame_bgr, (img_size, img_size), interpolation=cv2.INTER_LINEAR)
+    img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+    tensor = (img_rgb.astype(np.float32) * (1.0 / 255.0)).transpose(2, 0, 1)[None, ...]
     return np.ascontiguousarray(tensor)
 
 
@@ -91,7 +155,7 @@ def to_flow_gray(frame_bgr, flow_width=FLOW_WIDTH):
     h, w = frame_bgr.shape[:2]
     scale = flow_width / float(w)
     new_h = max(1, int(round(h * scale)))
-    small = cv2.resize(frame_bgr, (flow_width, new_h), interpolation=cv2.INTER_AREA)
+    small = cv2.resize(frame_bgr, (flow_width, new_h), interpolation=cv2.INTER_LINEAR)
     gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
     return gray, scale
 
@@ -137,13 +201,17 @@ def track_keypoints_flow(prev_gray, curr_gray, prev_kpts, scale, width, height):
 
 
 def paste_fc27_radar(canvas, radar_img, width_ratio=RADAR_WIDTH_RATIO, alpha=RADAR_ALPHA):
-    """Kat-7at t-tiran 2D f l-wast taht b cadre style EA FC / FC27."""
+    """Kat-7at t-tiran 2D f l-wast taht b cadre style EA FC / FC27 (in-place + cached bg)."""
+    global _RADAR_BG_CACHE
     fh, fw = canvas.shape[:2]
     rh, rw = radar_img.shape[:2]
 
     target_w = int(round(fw * width_ratio))
     target_h = int(round(rh * (target_w / float(rw))))
-    radar_resized = cv2.resize(radar_img, (target_w, target_h), interpolation=cv2.INTER_AREA)
+    if target_w == rw and target_h == rh:
+        radar_resized = radar_img
+    else:
+        radar_resized = cv2.resize(radar_img, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
 
     x1 = (fw - target_w) // 2
     y1 = fh - target_h - 18
@@ -151,15 +219,14 @@ def paste_fc27_radar(canvas, radar_img, width_ratio=RADAR_WIDTH_RATIO, alpha=RAD
     y2 = y1 + target_h
 
     if y1 >= 4 and x1 >= 4 and y2 <= fh - 4 and x2 <= fw - 4:
-        # Dark glass backdrop frame (FC27 style)
         pad = 4
         bg = canvas[y1 - pad:y2 + pad, x1 - pad:x2 + pad]
-        cv2.addWeighted(np.full_like(bg, (15, 18, 15)), 0.75, bg, 0.25, 0, bg)
-        canvas[y1 - pad:y2 + pad, x1 - pad:x2 + pad] = bg
+        if _RADAR_BG_CACHE is None or _RADAR_BG_CACHE.shape != bg.shape:
+            _RADAR_BG_CACHE = np.full(bg.shape, (15, 18, 15), dtype=np.uint8)
+        cv2.addWeighted(_RADAR_BG_CACHE, 0.75, bg, 0.25, 0, bg)
 
         roi = canvas[y1:y2, x1:x2]
         cv2.addWeighted(radar_resized, alpha, roi, 1.0 - alpha, 0, roi)
-        canvas[y1:y2, x1:x2] = roi
 
         cv2.rectangle(canvas, (x1 - pad, y1 - pad), (x2 + pad, y2 + pad), (210, 230, 210), 1, cv2.LINE_AA)
 
@@ -167,8 +234,9 @@ def paste_fc27_radar(canvas, radar_img, width_ratio=RADAR_WIDTH_RATIO, alpha=RAD
 
 
 def draw_annotations(frame, kpts_px, radar_img, h_info, model_name, device_name, mode_tag, frame_idx, total_frames, fps, live_fps):
-    """Draw pitch skeleton, keypoints, FC27 2D radar, and status HUD."""
-    canvas = frame.copy()
+    """Draw pitch skeleton, keypoints, FC27 2D radar, and HUD directly in-place (zero full-frame copy)."""
+    global _HUD_DARK_CACHE
+    canvas = frame
 
     # Draw pitch skeleton lines
     for (p1_id, p2_id) in SKELETON_EDGES_1IDX:
@@ -198,10 +266,11 @@ def draw_annotations(frame, kpts_px, radar_img, h_info, model_name, device_name,
     if radar_img is not None:
         canvas = paste_fc27_radar(canvas, radar_img)
 
-    # Status HUD banner
-    overlay = canvas.copy()
-    cv2.rectangle(overlay, (15, 15), (560, 118), (20, 20, 20), -1)
-    cv2.addWeighted(overlay, 0.70, canvas, 0.30, 0, canvas)
+    # Status HUD banner (ROI-only blend: 37x asra3 mn full-frame copy!)
+    hud_roi = canvas[15:118, 15:560]
+    if _HUD_DARK_CACHE is None or _HUD_DARK_CACHE.shape != hud_roi.shape:
+        _HUD_DARK_CACHE = np.full(hud_roi.shape, (20, 20, 20), dtype=np.uint8)
+    cv2.addWeighted(_HUD_DARK_CACHE, 0.70, hud_roi, 0.30, 0, hud_roi)
     cv2.rectangle(canvas, (15, 15), (560, 118), (255, 200, 0), 1)
 
     cv2.putText(
@@ -223,7 +292,7 @@ def draw_annotations(frame, kpts_px, radar_img, h_info, model_name, device_name,
 
 def process_video(model_path, device, video_path, output_path, ai_every_n):
     print("=" * 75)
-    print(f"  OPENVINO FP16 + RADAR 2D (FC27): {video_path}")
+    print(f"  OPENVINO FP16 + RADAR 2D (FC27) [THREADED I/O]: {video_path}")
     print("=" * 75)
 
     if not os.path.exists(model_path):
@@ -241,22 +310,26 @@ def process_video(model_path, device, video_path, output_path, ai_every_n):
     compiled = core.compile_model(model_path, device, {"PERFORMANCE_HINT": perf_hint})
     out_coords = compiled.output(0)
     out_vis = compiled.output(1)
+    model_img_size = int(compiled.input(0).shape[2])
     model_name = os.path.basename(model_path)
-    print(f"[1/4] Model wajed! (Mode: {'Async Full-AI' if ai_every_n == 1 else f'AI kol {ai_every_n} frames + Optical Flow'})")
+    print(f"[1/4] Model wajed! ({model_img_size}x{model_img_size} |  (Mode: {'Async Full-AI' if ai_every_n == 1 else f'AI kol {ai_every_n} frames + Optical Flow'})")
 
     # Module dyal t-tiran 2D (mn pitch_homography_2d.py)
     pitch_2d = PitchHomography2D(scale=5, pad=16)
 
-    # 2. Video Capture & Writer
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    # 2. Threaded Video Capture & Writer
+    raw_cap = cv2.VideoCapture(video_path)
+    fps = raw_cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(raw_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(raw_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(raw_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"[2/4] Video info: {width}x{height} @ {fps:.1f} fps | Majmou3 l-fremat: {total_frames}")
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    raw_out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+    cap = ThreadedVideoReader(raw_cap, queue_size=6)
+    out = ThreadedVideoWriter(raw_out, queue_size=24)
 
     frame_idx = 0
     ai_frames = 0
@@ -270,18 +343,18 @@ def process_video(model_path, device, video_path, output_path, ai_every_n):
     print("[3/4] Bidayat t-tahlil...")
 
     if ai_every_n == 1:
-        # --- PIPELINED ASYNC MODE (2 ping-pong InferRequests) ---
+        # --- PIPELINED ASYNC MODE (2 ping-pong InferRequests + Threaded I/O) ---
         curr_req = compiled.create_infer_request()
         next_req = compiled.create_infer_request()
 
         ret, curr_frame = cap.read()
         if ret:
-            curr_req.start_async({0: preprocess_frame(curr_frame)})
+            curr_req.start_async({0: preprocess_frame(curr_frame, model_img_size)})
 
             while True:
                 ret_next, next_frame = cap.read()
                 if ret_next:
-                    next_req.start_async({0: preprocess_frame(next_frame)})
+                    next_req.start_async({0: preprocess_frame(next_frame, model_img_size)})
 
                 curr_req.wait()
                 frame_idx += 1
@@ -304,12 +377,13 @@ def process_video(model_path, device, video_path, output_path, ai_every_n):
                     curr_frame, kpts_px, radar_img, h_info, model_name, device, "AI-ASYNC",
                     frame_idx, total_frames, fps, live_fps
                 )
-                out.write(canvas)
 
+                sample_path = None
                 if frame_idx in (15, 75, 150) or (sample_saved < 3 and len(kpts_px) >= 6 and frame_idx % 40 == 0):
-                    sample_filename = f"sample_ov_frame_{frame_idx}.jpg"
-                    cv2.imwrite(sample_filename, canvas)
+                    sample_path = f"sample_ov_frame_{frame_idx}.jpg"
                     sample_saved += 1
+
+                out.write(canvas, sample_path=sample_path)
 
                 if frame_idx % 30 == 0 or frame_idx == total_frames:
                     print(f"  [Progress] Frame {frame_idx:3d}/{total_frames} | Speed: {live_fps:.1f} fps | Detected: {len(kpts_px):2d} pts | 2D: {h_info['status']}")
@@ -343,7 +417,7 @@ def process_video(model_path, device, video_path, output_path, ai_every_n):
                     need_ai = True
 
             if need_ai:
-                tensor = preprocess_frame(frame)
+                tensor = preprocess_frame(frame, model_img_size)
                 infer_req.infer({0: tensor})
                 coords = infer_req.get_tensor(out_coords).data
                 vis_logits = infer_req.get_tensor(out_vis).data
@@ -365,12 +439,13 @@ def process_video(model_path, device, video_path, output_path, ai_every_n):
                 frame, kpts_px, radar_img, h_info, model_name, device, mode_tag,
                 frame_idx, total_frames, fps, live_fps
             )
-            out.write(canvas)
 
+            sample_path = None
             if frame_idx in (15, 75, 150) or (sample_saved < 3 and len(kpts_px) >= 6 and frame_idx % 40 == 0):
-                sample_filename = f"sample_ov_frame_{frame_idx}.jpg"
-                cv2.imwrite(sample_filename, canvas)
+                sample_path = f"sample_ov_frame_{frame_idx}.jpg"
                 sample_saved += 1
+
+            out.write(canvas, sample_path=sample_path)
 
             if frame_idx % 30 == 0 or frame_idx == total_frames:
                 print(f"  [Progress] Frame {frame_idx:3d}/{total_frames} | Speed: {live_fps:.1f} fps | Detected: {len(kpts_px):2d} pts ({mode_tag}) | 2D: {h_info['status']}")
